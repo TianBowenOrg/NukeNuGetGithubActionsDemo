@@ -1,4 +1,9 @@
 {
   "$schema": "./build.schema.json",
-  "Solution": "Nuke.Demo.sln"
+  "Solution": "Nuke.Demo.sln",
+  "ArtifactsType": "*.nupkg",
+  "Copyright": "@Arwin 2023",
+  "ExcludedArtifactsType": "",
+  "NugetFeed": ""
+
 }

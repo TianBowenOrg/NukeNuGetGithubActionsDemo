@@ -28,25 +28,33 @@ using System.Linq;
 using Nuke.Common;
 using Nuke.Common.IO;
 using Nuke.Common.Git;
-using Nuke.Common.Tools.DotNet;
 using Nuke.Common.ProjectModel;
-using Nuke.Common.CI.GitHubActions;
+using Nuke.Common.Tools.DotNet;
 using Nuke.Common.Tools.GitVersion;
 using Nuke.Common.Utilities.Collections;
-using Nuke.Common.Tools.NerdbankGitVersioning;
+using Nuke.Common.CI.GitHubActions;
 
 using static Nuke.Common.IO.FileSystemTasks;
 using static Nuke.Common.IO.PathConstruction;
 using static Nuke.Common.Tools.DotNet.DotNetTasks;
+using System.IO;
+using Octokit;
+using System.Threading.Tasks;
+using Nuke.Common.Tools.GitHub;
+using Nuke.Common.ChangeLog;
+using System;
+using Octokit.Internal;
+using ParameterAttribute = Nuke.Common.ParameterAttribute;
 
-[GitHubActions("continuous", 
-    GitHubActionsImage.UbuntuLatest, 
-    AutoGenerate = false, 
-    FetchDepth = 0, 
-    OnPushBranches = new[] { "main", "dev", "releases/**" }, 
-    OnPullRequestBranches = new[] { "releases/**" }, 
+[GitHubActions("continuous",
+    GitHubActionsImage.UbuntuLatest,
+    AutoGenerate = false,
+    FetchDepth = 0,
+    OnPushBranches = new[] { "main", "dev", "releases/**" },
+    OnPullRequestBranches = new[] { "releases/**" },
     InvokedTargets = new[] {
-        nameof(Clean)
+        //nameof(Clean)
+        nameof(Pack)
     }, EnableGitHubToken = true,
     ImportSecrets = new[] { nameof(NuGetApiKey) }
     )]
@@ -93,6 +101,9 @@ class Build : NukeBuild
 
     static AbsolutePath ArtifactsDirectory => RootDirectory / ".artifacts";
 
+    static readonly string PackageContentType = "application/octet-stream";
+    static string ChangeLogFile => RootDirectory / "CHANGELOG.md";
+
     string GithubNugetFeed => GitHubActions != null ? $"https://nuget.pkg.github.com/{GitHubActions.RepositoryOwner}/index.json"
         : null;
 
@@ -115,9 +126,11 @@ class Build : NukeBuild
 
     Target Clean => _ => _
         .Description("清理项目")
+        .Before(Restore)
         .Executes(() =>
         {
             DotNetClean(c => c.SetProject(Solution.src.Nuke_HelloWorld));
+            EnsureCleanDirectory(ArtifactsDirectory);
         });
 
     Target Restore => _ => _
@@ -133,7 +146,8 @@ class Build : NukeBuild
         .DependsOn(Restore)
         .Executes(() =>
         {
-            DotNetBuild(b => b.SetProjectFile(Solution.src.Nuke_HelloWorld)
+            DotNetBuild(b => b
+            .SetProjectFile(Solution.src.Nuke_HelloWorld)
             .SetConfiguration(Configuration)
             .SetVersion(GitVersion.NuGetVersionV2)
             .SetAssemblyVersion(GitVersion.AssemblySemVer)
@@ -167,10 +181,14 @@ class Build : NukeBuild
 
     Target PublishToGitHub => _ => _
         .Description("发布到Github仅用于开发")
+        .Triggers(CreateRelease)
         .Requires(() => Configuration.Equals(Configuration.Release))
         .OnlyWhenStatic(() => GitRepository.IsOnDevelopBranch() || GitHubActions.IsPullRequest)
         .Executes(() =>
         {
+            Console.WriteLine($"{GitRepository == null} {GitHubActions == null}");
+            Console.WriteLine($"Run GitHub {GitRepository?.IsOnDevelopBranch()} && {GitHubActions?.IsPullRequest}");            
+
             GlobFiles(ArtifactsDirectory, ArtifactsType)
                 .Where(x => !x.EndsWith(ExcludedArtifactsType))
                 .ForEach(x =>
@@ -186,9 +204,10 @@ class Build : NukeBuild
 
 
     Target PublishToNuGet => _ => _
-    .Description($"Publishing to NuGet with the version.")
+    .Description($"将这个版本发布到NuGet")
     .Requires(() => Configuration.Equals(Configuration.Release))
-    .OnlyWhenStatic(() => GitRepository.IsOnMainOrMasterBranch())
+    .Triggers(CreateRelease)
+    .OnlyWhenStatic(() => GitRepository.IsOnReleaseBranch())
     .Executes(() =>
     {
         GlobFiles(ArtifactsDirectory, ArtifactsType)
@@ -203,6 +222,94 @@ class Build : NukeBuild
                 );
             });
     });
+
+
+    Target CreateRelease => _ => _
+        .Description("创建发布Release版本")
+        .Requires(() => Configuration.Equals(Configuration.Release))
+        .OnlyWhenDynamic(() => GitRepository.IsOnMainOrMasterBranch() || GitRepository.IsOnReleaseBranch())
+        .Executes(async () =>
+        {
+            var credentials = new Credentials(GitHubActions.Token);
+            GitHubTasks.GitHubClient = new GitHubClient(new ProductHeaderValue(nameof(NukeBuild)),
+               new InMemoryCredentialStore(credentials));
+
+            var (owner, name) = (GitRepository.GetGitHubOwner(), GitRepository.GetGitHubName());
+
+            var releaseTag = GitVersion.NuGetVersionV2;
+            var changeLogSectionEntries = ChangelogTasks.ExtractChangelogSectionNotes(ChangeLogFile);
+            var latestChangeLog = changeLogSectionEntries.Aggregate((c, n) => c + Environment.NewLine + n);
+
+            var newRelease = new NewRelease(releaseTag)
+            {
+                TargetCommitish = GitVersion.Sha,
+                Draft = true,
+                Name = $"v{releaseTag}",
+                Prerelease = !string.IsNullOrEmpty(GitVersion.PreReleaseTag),
+                Body = latestChangeLog
+            };
+            
+
+            var createdRelease = await GitHubTasks.GitHubClient.Repository.Release.Create(owner, name, newRelease);
+
+            //GlobFiles(ArtifactsDirectory, ArtifactsType)
+            //    .Where(x=> !x.EndsWith(ExcludedArtifactsType))
+            //    .ForEach(async x => await UploadReleaseAssetToGitHub(createdRelease, x));
+
+            GlobFiles(ArtifactsDirectory, ArtifactsType)
+             .Where(x => !x.EndsWith(ExcludedArtifactsType))
+             .ForEach(async x => await UploadReleaseAssetToGithub(createdRelease, x));
+
+            await GitHubTasks
+                  .GitHubClient
+                  .Repository
+                  .Release
+                  .Edit(owner, name, createdRelease.Id, new ReleaseUpdate { Draft = false });
+        });
+
+    private static async Task UploadReleaseAssetToGithub(Release release, string asset)
+    {
+        await using var artifactStream = File.OpenRead(asset);
+        var fileName = Path.GetFileName(asset);
+        var assetUpload = new ReleaseAssetUpload
+        {
+            FileName = fileName,
+            ContentType = PackageContentType,
+            RawData = artifactStream,
+        };
+        await GitHubTasks.GitHubClient.Repository.Release.UploadAsset(release, assetUpload);
+    }
+
+
+    //private static async Task UploadReleaseAssetToGitHub1(Release release,string asset)
+    //{
+    //    await using var artifactStream = File.OpenRead(asset);
+    //    var fileName = Path.GetFileName(asset);
+    //    var assetUPload = new ReleaseAssetUpload
+    //    {
+    //        FileName = fileName,
+    //        ContentType = PackageContentType,
+    //        RawData = artifactStream,
+    //    };
+
+    //    await GitHubTasks.GitHubClient.Repository.Release
+    //        .UploadAsset(release, assetUPload);
+    //}
+
+    //private static async Task UploadReleaseAssetToGithub(Release release, string asset)
+    //{
+    //    await using var artifactStream = File.OpenRead(asset);
+    //    var fileName = Path.GetFileName(asset);
+    //    var assetUpload = new ReleaseAssetUpload
+    //    {
+    //        FileName = fileName,
+    //        ContentType = PackageContentType,
+    //        RawData = artifactStream,
+    //    };
+    //    await GitHubTasks.GitHubClient.Repository.Release.UploadAsset(release, assetUpload);        
+    //}
+
+
 
     // 异步执行
 
